@@ -17,10 +17,12 @@ app.get('/', (req, res) => {
 });
 
 // Import Routes
-app.use('/auth', require('./routes/auth'));
-app.use('/bugs', require('./routes/bugs'));
-app.use('/admin', require('./routes/admin'));
-app.use('/github', require('./routes/github'));
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/bugs', require('./routes/bugs'));
+app.use('/api/admin', require('./routes/admin'));
+app.use('/api/github', require('./routes/github'));
+app.use('/api/developer', require('./routes/developer'));
+app.use('/api/projects', require('./routes/projects'));
 
 const PORT = process.env.PORT || 8000;
 

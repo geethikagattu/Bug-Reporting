@@ -1,142 +1,223 @@
 const express = require('express');
 const router = express.Router();
 const Bug = require('../models/Bug');
-const jwt = require('jsonwebtoken');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
+const BugHistory = require('../models/BugHistory');
+const Classification = require('../models/Classification');
+const Localization = require('../models/Localization');
+const Assignment = require('../models/Assignment');
+const CommitHistory = require('../models/CommitHistory');
+const FileIndex = require('../models/FileIndex');
+const Project = require('../models/Project');
 
-// Ensure uploads directory exists
-const uploadDir = path.join(__dirname, '../uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+const auth = require('../middleware/auth');
+const role = require('../middleware/role');
+const classifyService = require('../services/classifyService');
+const assignService = require('../services/assignService');
 
-// Multer storage config
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const unique = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, unique + path.extname(file.originalname));
-  }
-});
-const upload = multer({
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
-  fileFilter: (req, file, cb) => {
-    // Allow images, PDFs, text, logs, zip
-    const allowed = /jpeg|jpg|png|gif|pdf|txt|log|zip|docx|xlsx|csv/;
-    const ext = allowed.test(path.extname(file.originalname).toLowerCase());
-    if (ext) return cb(null, true);
-    cb(new Error('File type not allowed'));
-  }
-});
-
-// Auth middleware
-const auth = (req, res, next) => {
-  const token = req.header('x-auth-token');
-  if (!token) return res.status(401).json({ msg: 'No token, auth denied' });
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secretToken');
-    req.user = decoded.user;
-    next();
-  } catch (err) {
-    res.status(401).json({ msg: 'Token is not valid' });
-  }
-};
-
-// @route POST /bugs/create  (supports multipart/form-data for file attachments)
-router.post('/create', auth, upload.array('attachments', 5), async (req, res) => {
+// @route POST /api/bugs
+router.post('/', auth, async (req, res) => {
   try {
     const { title, description, priority, projectId } = req.body;
-
-    // Build attachment metadata
-    const attachments = (req.files || []).map(f => ({
-      originalName: f.originalname,
-      filename: f.filename,
-      mimetype: f.mimetype,
-      size: f.size,
-      url: `/uploads/${f.filename}`
-    }));
-
-    // Call ML Service
-    let mlClassification = { isValid: true, confidence: 0.95 };
-    let localizedFiles = [];
-    let assignedTo = null;
-
-    try {
-      const mlRes = await fetch('http://localhost:5000/api/ml/classify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: title + ' ' + description })
-      });
-      if (mlRes.ok) mlClassification = await mlRes.json();
-    } catch (e) { console.log('ML Classify error:', e.message); }
-
-    try {
-      const locRes = await fetch('http://localhost:5000/api/ml/localize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: description })
-      });
-      if (locRes.ok) localizedFiles = (await locRes.json()).files;
-    } catch (e) { console.log('ML Localize error:', e.message); }
-
-    try {
-      const assignRes = await fetch('http://localhost:5000/api/ml/assign', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: description, projectId })
-      });
-      if (assignRes.ok) assignedTo = (await assignRes.json()).developerId;
-    } catch (e) { console.log('ML Assign error:', e.message); }
-
+    
     const bug = new Bug({
       title,
       description,
       priority,
       project: projectId,
       reporter: req.user.id,
-      assignedTo,
-      mlClassification,
-      localizedFiles,
-      attachments,
-      history: [{ status: 'Open', updatedBy: req.user.id, comment: 'Bug reported' }]
+      status: 'Open'
+    });
+    await bug.save();
+
+    await BugHistory.create({
+      bug: bug._id,
+      status: 'Open',
+      updatedBy: req.user.id,
+      comment: 'Bug submitted by tester'
     });
 
-    await bug.save();
-    res.json(bug);
+    res.status(201).json(bug);
+
+    // Asynchronous Pipeline
+    processBugPipeline(bug, description, projectId);
+
   } catch (err) {
     console.error(err.message);
-    res.status(500).send('Server error');
+    res.status(500).send('Server Error');
   }
 });
 
-// @route GET /bugs
-router.get('/', auth, async (req, res) => {
+async function processBugPipeline(bug, description, projectId) {
   try {
-    let bugs;
-    if (req.user.role === 'Admin') {
-      bugs = await Bug.find().populate('reporter assignedTo project', 'name email');
-    } else if (req.user.role === 'Developer') {
-      bugs = await Bug.find({ assignedTo: req.user.id }).populate('reporter project', 'name email');
-    } else {
-      bugs = await Bug.find({ reporter: req.user.id }).populate('assignedTo project', 'name email');
+    // 1. Classify
+    const { isValid, confidence, classificationId } = await classifyService.classifyBug(bug._id, bug.title, description);
+    
+    // Update inline for quick access
+    await Bug.findByIdAndUpdate(bug._id, { mlClassification: { isValid, confidence } });
+
+    if (!isValid) {
+      await Bug.findByIdAndUpdate(bug._id, { status: 'Closed' });
+      await BugHistory.create({ bug: bug._id, status: 'Closed', comment: 'Auto-closed by ML: Invalid Bug' });
+      return; // Stop pipeline
     }
+
+    // 2. Localize
+    // Fetch files from Project's repo to send to python (Simulating file fetch)
+    const project = await Project.findById(projectId).populate('owner');
+    let projectFiles = [];
+    if (project) {
+        // Find repo by owner
+        const Repository = require('../models/Repository');
+        const repo = await Repository.findOne({ userId: project.owner });
+        if (repo) {
+          const files = await FileIndex.find({ repositoryId: repo._id }).limit(100);
+          projectFiles = files.map(f => ({ path: f.path, name: f.path.split('/').pop() }));
+        }
+    }
+    
+    // Fallback Mock files if testing
+    if (projectFiles.length === 0) {
+      projectFiles = [
+        { path: 'src/main.js', name: 'main.js' },
+        { path: 'src/auth/login.js', name: 'login.js' }
+      ];
+    }
+
+    const localizedFiles = await classifyService.localizeBug(bug._id, description, projectFiles);
+    await Bug.findByIdAndUpdate(bug._id, { localizedFiles });
+
+    // 3. Assign
+    if (localizedFiles.length > 0) {
+      const devId = await assignService.assignDeveloper(bug._id, localizedFiles, async (files) => {
+        // Fetch commits touching these files
+        // A minimal simulation
+        return [
+          { hash: '123', authorEmail: 'dev@test.com', message: 'fixed src/main.js' }
+        ];
+      });
+    }
+
+  } catch (e) {
+    console.error("Pipeline error:", e);
+  }
+}
+
+// @route GET /api/bugs
+router.get('/', auth, role(['Admin']), async (req, res) => {
+  try {
+    const { status, priority, projectId } = req.query;
+    const filter = {};
+    if (status) filter.status = status;
+    if (priority) filter.priority = priority;
+    if (projectId) filter.project = projectId;
+
+    const bugs = await Bug.find(filter).populate('reporter assignedTo project', 'name email');
     res.json(bugs);
   } catch (err) {
     res.status(500).send('Server Error');
   }
 });
 
-// @route PUT /bugs/update-status/:id
-router.put('/update-status/:id', auth, async (req, res) => {
+// @route GET /api/bugs/my
+router.get('/my', auth, role(['Tester']), async (req, res) => {
   try {
-    const { status, comment } = req.body;
-    let bug = await Bug.findById(req.params.id);
+    const bugs = await Bug.find({ reporter: req.user.id }).populate('assignedTo project', 'name');
+    res.json(bugs);
+  } catch (err) {
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route GET /api/bugs/assigned
+router.get('/assigned', auth, role(['Developer']), async (req, res) => {
+  try {
+    const bugs = await Bug.find({ assignedTo: req.user.id }).populate('reporter project', 'name');
+    res.json(bugs);
+  } catch (err) {
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route GET /api/bugs/:id
+router.get('/:id', auth, async (req, res) => {
+  try {
+    const bug = await Bug.findById(req.params.id)
+      .populate('reporter assignedTo project', 'name email');
+    
     if (!bug) return res.status(404).json({ msg: 'Bug not found' });
-    bug.status = status;
-    bug.history.push({ status, updatedBy: req.user.id, comment });
+
+    const classification = await Classification.findOne({ bug: bug._id });
+    const localization = await Localization.find({ bug: bug._id }).sort('rank');
+    const history = await BugHistory.find({ bug: bug._id }).sort('updatedAt').populate('updatedBy', 'name');
+    const assignment = await Assignment.findOne({ bug: bug._id }).populate('developer', 'name');
+
+    res.json({
+      ...bug._doc,
+      classificationResult: classification,
+      localizationFiles: localization,
+      historyLog: history,
+      assignmentInfo: assignment
+    });
+  } catch (err) {
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route PUT /api/bugs/:id
+router.put('/:id', auth, async (req, res) => {
+  try {
+    const bug = await Bug.findById(req.params.id);
+    if (!bug) return res.status(404).json({ msg: 'Bug not found' });
+    
+    if (req.user.role !== 'Admin' && bug.reporter.toString() !== req.user.id) {
+      return res.status(401).json({ msg: 'Not authorized' });
+    }
+
+    const { title, description, priority } = req.body;
+    if (title) bug.title = title;
+    if (description) bug.description = description;
+    if (priority) bug.priority = priority;
+
     await bug.save();
     res.json(bug);
+  } catch (err) {
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route PUT /api/bugs/:id/status
+router.put('/:id/status', auth, async (req, res) => {
+  try {
+    const bug = await Bug.findById(req.params.id);
+    if (!bug) return res.status(404).json({ msg: 'Bug not found' });
+    
+    // Both assigned developer and admin can update status
+    if (req.user.role !== 'Admin' && bug.assignedTo?.toString() !== req.user.id) {
+      return res.status(403).json({ msg: 'Not authorized to update this bug status' });
+    }
+
+    bug.status = req.body.status;
+    await bug.save();
+    
+    await BugHistory.create({
+      bug: bug._id,
+      status: req.body.status,
+      updatedBy: req.user.id,
+      comment: 'Status updated manually'
+    });
+
+    res.json(bug);
+  } catch (err) {
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route DELETE /api/bugs/:id
+router.delete('/:id', auth, role(['Admin']), async (req, res) => {
+  try {
+    const bug = await Bug.findByIdAndDelete(req.params.id);
+    if (!bug) return res.status(404).json({ msg: 'Bug not found' });
+    res.json({ msg: 'Bug deleted' });
   } catch (err) {
     res.status(500).send('Server Error');
   }
