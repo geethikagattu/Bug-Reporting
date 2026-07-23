@@ -64,3 +64,9 @@ Thumbs.db
 coverage/
 *.log
 *.sqlite3
+
+# Maven / Java
+target/
+**/target/
+*.class
+

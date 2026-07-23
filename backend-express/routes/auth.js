@@ -128,10 +128,10 @@ router.get('/github/callback', async (req, res) => {
     const payload = { user: { id: user.id, role: user.role } };
     const token = jwt.sign(payload, process.env.JWT_SECRET || 'secretToken', { expiresIn: '30d' });
 
-    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/github-auth?token=${token}`);
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5000'}/github-auth?token=${token}`);
   } catch (error) {
     console.error("GitHub Auth Error:", error.message);
-    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/login?error=github_auth_failed`);
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5000'}/login?error=github_auth_failed`);
   }
 });
 
